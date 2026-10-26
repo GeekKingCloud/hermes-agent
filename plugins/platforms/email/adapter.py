@@ -70,6 +70,11 @@ _PREAUTH_FETCH = (
     f"(BODY.PEEK[HEADER.FIELDS (FROM AUTHENTICATION-RESULTS {' '.join(h.upper() for h in _AUTOMATED_HEADERS)})]"
     f"<0.{_MAX_PREAUTH_HEADER_BYTES + 1}>)"
 )
+# A UID FETCH reply names its UID, and the literal belongs to the item just before ``{n}``.
+_FETCH_UID_RE = re.compile(rb"\bUID (\d+)", re.IGNORECASE)
+_FETCH_LITERAL_RE = re.compile(rb"(?:BODY\[[^\]]*\](?:<\d+>)?|RFC822) \{\d+\}$", re.IGNORECASE)
+# Polls a UID may come back without a literal (listed UNSEEN before the server can serve it) before it is dropped.
+_MAX_PAYLOAD_MISSES = 3
 # Authentication-Results clause head (``dmarc=pass``), matched only at the start of a clause.
 _AUTH_METHOD_RE = re.compile(r"\s*(dmarc|dkim|spf)\s*=\s*([a-z]+)", re.IGNORECASE)
 _NO_AUTH_RESULTS_REASON = "no Authentication-Results header"
@@ -209,13 +214,32 @@ def _is_automated_sender(address: str, headers: dict) -> bool:
         (value := headers.get(header, "")) and check(value) for header, check in _AUTOMATED_HEADERS.items())
 
 
-def _imap_payload(data: Any) -> Optional[bytes]:
-    """The bytes of a one-message IMAP FETCH response, or ``None`` for an unexpected shape (see #80032)."""
-    try:
-        payload = data[0][1]
-    except (IndexError, TypeError):
-        return None
-    return bytes(payload) if isinstance(payload, (bytes, bytearray)) else None
+def _imap_payload(data: Any, uid: Any = None) -> Optional[bytes]:
+    """The literal of *uid*'s BODY[]/RFC822 item in a FETCH response, or ``None`` if none arrived (see #80032).
+
+    Unsolicited FETCH replies (flag updates, other UIDs) can precede ours, so ``data[0]`` is not trusted.
+    """
+    want = uid if isinstance(uid, bytes) else str(uid).encode()
+    fallback = None
+    for item in data if isinstance(data, (list, tuple)) else ():
+        if not (isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], (bytes, bytearray))):
+            continue
+        prefix = bytes(item[0]) if isinstance(item[0], (bytes, bytearray)) else b""
+        if (named := _FETCH_UID_RE.search(prefix)) is None:
+            fallback = fallback if fallback is not None else bytes(item[1])  # server omitted UID: legacy shape
+        elif (uid is None or named.group(1) == want) and _FETCH_LITERAL_RE.search(prefix):
+            return bytes(item[1])
+    return fallback
+
+
+def _imap_size(imap: imaplib.IMAP4, uid: Any) -> str:
+    """RFC822.SIZE of *uid* for a drop log line, or ``unknown``; never raises."""
+    with suppress(Exception):
+        status, data = imap.uid("fetch", uid, "(RFC822.SIZE)")
+        found = re.search(rb"RFC822\.SIZE (\d+)", b" ".join(x if isinstance(x, bytes) else b"" for x in data or ()))
+        if status == "OK" and found:
+            return found.group(1).decode()
+    return "unknown"
 
 
 def check_email_requirements() -> bool:
@@ -491,6 +515,7 @@ class EmailAdapter(BasePlatformAdapter):
         self._authserv_id = (extra.get("authserv_id", "") or _get_secret("EMAIL_AUTHSERV_ID", "")).strip().lower()
         self._seen_uids: set = set()
         self._seen_uids_max: int = 2000   # cap to prevent unbounded memory growth
+        self._payload_misses: dict = {}   # (UID, stage) -> polls that returned no FETCH literal yet
         self._poll_task: Optional[asyncio.Task] = None
         self._last_fetch_failed, self._last_fetch_error = False, ""  # "checked, nothing new" vs "the check itself failed"
         # chat_id (sender email) -> last subject + message-id for threading
@@ -675,21 +700,37 @@ class EmailAdapter(BasePlatformAdapter):
         if status != "OK":
             logger.warning("[Email] Could not mark rejected UID %s seen", uid)
 
+    def _payload_missing(self, imap: imaplib.IMAP4, uid: Any, what: str) -> bool:
+        """Count a FETCH with no literal; False while it should be retried next poll, True (logged) once it is dropped."""
+        misses = self._payload_misses[uid, what] = self._payload_misses.get((uid, what), 0) + 1
+        if misses < _MAX_PAYLOAD_MISSES:
+            logger.info("[Email] No %s payload yet for UID %s (poll %d/%d); retrying next poll", what, uid, misses, _MAX_PAYLOAD_MISSES)
+            return False
+        logger.error("[Email] Dropping UID %s (size %s): no %s payload after %d polls", uid, _imap_size(imap, uid), what, misses)
+        return True
+
     def _fetch_new_messages(self, preauthorize: Callable[[dict[str, Any]], bool]) -> list[dict[str, Any]]:
         """Fetch unseen messages; bounded headers pass *preauthorize* before RFC822 is requested."""
         results = []
         try:
             with self._inbox() as imap:
                 status, data = imap.uid("search", None, "UNSEEN")
-                for uid in (data[0].split() if status == "OK" and data and data[0] else []):
+                unseen = data[0].split() if status == "OK" and data and data[0] else []
+                self._payload_misses = {k: n for k, n in self._payload_misses.items() if k[0] in unseen}
+                for uid in unseen:
                     if uid in self._seen_uids:
                         continue
                     header_status, header_data = imap.uid("fetch", uid, _PREAUTH_FETCH)
                     if header_status != "OK":
                         continue
-                    raw_headers = _imap_payload(header_data)
-                    if raw_headers is None or len(raw_headers) > _MAX_PREAUTH_HEADER_BYTES:
-                        logger.warning("[Email] Unusable pre-authorization headers for UID %s, skipping", uid)
+                    if (raw_headers := _imap_payload(header_data, uid)) is None:
+                        if self._payload_missing(imap, uid, "header"):
+                            self._mark_uid_consumed(imap, uid)
+                        continue  # listed before its content is fetchable: retry next poll
+                    self._payload_misses.pop((uid, "header"), None)
+                    if len(raw_headers) > _MAX_PREAUTH_HEADER_BYTES:
+                        logger.error("[Email] Dropping UID %s (size %s): pre-authorization headers exceed %d bytes",
+                                     uid, _imap_size(imap, uid), _MAX_PREAUTH_HEADER_BYTES)
                         self._mark_uid_consumed(imap, uid)
                         continue
                     try:
@@ -704,12 +745,16 @@ class EmailAdapter(BasePlatformAdapter):
                     status, msg_data = imap.uid("fetch", uid, "(RFC822)")
                     if status != "OK":
                         continue  # transient per-UID refusal: leave unseen so the next poll retries
-                    # Mark seen once a response arrived (even malformed) so garbage is skipped once, not retried forever —
+                    if (raw_email := _imap_payload(msg_data, uid)) is None and not self._payload_missing(imap, uid, "message"):
+                        if imap.uid("store", uid, "-FLAGS.SILENT", r"(\Seen)")[0] != "OK":  # keep it in the next UNSEEN search
+                            logger.warning("[Email] Could not clear \\Seen on UID %s; it may not be retried", uid)
+                        continue
+                    # Mark seen once a usable response arrived (or retries ran out) so garbage is skipped, not retried forever —
                     # but NOT before the fetch: a connection failure must leave the rest of the batch eligible for the next poll.
                     self._seen_uids.add(uid)
                     self._trim_seen_uids()
-                    if (raw_email := _imap_payload(msg_data)) is None:
-                        logger.warning("[Email] Unexpected IMAP response structure for UID %s, skipping", uid)
+                    self._payload_misses.pop((uid, "message"), None)
+                    if raw_email is None:
                         continue
                     # One poison message (unparseable headers, pathological attachment, DNS hiccup) must not abort the batch or force a reconnect.
                     try:

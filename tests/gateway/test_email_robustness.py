@@ -69,6 +69,46 @@ class TestImapResponseGuard(unittest.TestCase):
         results = self._fetch_with([("OK", [None])])
         self.assertEqual(results, [])
 
+    def test_missing_header_payload_is_retried_next_poll(self):
+        """A UID listed UNSEEN before its headers are fetchable is retried, not consumed and lost."""
+        adapter, header_replies = _make_adapter(), iter([("OK", [None]), ("OK", [(b"1 (UID 1 BODY[HEADER] {9}", _raw_email())])])
+
+        def uid_handler(command, *args):
+            if command == "search":
+                return ("OK", [b"1"])
+            if command == "fetch":
+                return next(header_replies) if "BODY.PEEK" in args[1] else ("OK", [(b"1 (UID 1 RFC822 {9}", _raw_email())])
+            return ("OK", [b""])
+
+        mock_imap = MagicMock()
+        mock_imap.uid.side_effect = uid_handler
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap):
+            self.assertEqual(adapter._fetch_new_messages(lambda _c: True), [])
+            self.assertNotIn(b"1", adapter._seen_uids)
+            self.assertNotIn(("store", b"1", "+FLAGS.SILENT", r"(\Seen)"), [c.args for c in mock_imap.uid.call_args_list])
+            results = adapter._fetch_new_messages(lambda _c: True)
+        self.assertEqual([r["sender_addr"] for r in results], ["user@test.com"])
+        self.assertIn(b"1", adapter._seen_uids)
+
+    def test_unsolicited_fetch_reply_before_ours_is_ignored(self):
+        """Flag updates and other UIDs' literals ahead of ours must not be used or make the UID look empty."""
+        adapter = _make_adapter()
+        noise = [b"3 (UID 7 FLAGS (\\Seen))", (b"4 (UID 8 BODY[HEADER] {9}", _raw_email(sender="other@test.com")), b")"]
+
+        def uid_handler(command, *args):
+            if command == "search":
+                return ("OK", [b"1"])
+            if command == "fetch":
+                item = "BODY[HEADER.FIELDS (FROM)]<0>" if "BODY.PEEK" in args[1] else "RFC822"
+                return ("OK", noise + [(b"1 (UID 1 " + item.encode() + b" {9}", _raw_email()), b")"])
+            return ("OK", [b""])
+
+        mock_imap = MagicMock()
+        mock_imap.uid.side_effect = uid_handler
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap):
+            results = adapter._fetch_new_messages(lambda c: c["sender_addr"] == "user@test.com")
+        self.assertEqual([r["sender_addr"] for r in results], ["user@test.com"])
+
 
 
 
