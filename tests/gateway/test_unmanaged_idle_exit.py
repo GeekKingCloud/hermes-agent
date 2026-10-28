@@ -91,6 +91,29 @@ async def test_queued_work_clients_adapters_and_cron_each_keep_it_up(tmp_path, m
         db.close()
 
 
+@pytest.mark.asyncio
+async def test_launch_home_deleted_underneath_does_not_hold_it_up(tmp_path, monkeypatch):
+    """The client deletes its throwaway home while the gateway it auto-started is still running. The
+    deleted-WAL guard then refuses every new SessionDB for that home, so the store gates read busy
+    forever, and its queued rows can never run: neither may hold the gateway up."""
+    import os
+    real_store_gates = run_idle_exit._store_gates_busy
+    runner, home, db, stops = _runner(tmp_path, monkeypatch)
+    monkeypatch.setattr(run_idle_exit, "_store_gates_busy", real_store_gates)
+    try:
+        db.create_session("s", source="cli")
+        epoch = begin_runtime_epoch(db, instance_id="owner")
+        admit_session_input(db, epoch=epoch, principal_id="p", session_id="s", request_id="r",
+                            payload={"text": "queued before teardown"})
+        for sidecar in ("state.db-wal", "state.db-shm"):
+            os.unlink(home / sidecar)
+        await asyncio.wait_for(run_idle_exit.unmanaged_idle_exit_watcher(runner), 5)
+        await runner._idle_exit_stop_task
+        assert stops == [True]
+    finally:
+        db.close()
+
+
 def test_a_profile_still_starting_leaves_the_served_ledgers_readable(tmp_path, monkeypatch):
     """Hot-serve reserves a starting profile's registry slot before its authority exists. The probe
     still reads every built profile's ledger meanwhile, instead of failing on the slot."""
