@@ -131,7 +131,9 @@ def _retired_homes(runner) -> set[Path]:
     retired = set()
     for authority in all_authorities(runner):
         try:
-            authority.db._raise_if_db_replaced()
+            # Under _lock: mid-close() the sidecars are gone before the generation is cleared.
+            with authority.db._lock:
+                authority.db._raise_if_db_replaced()
         except StateDbReplacedError:
             retired.add(Path(authority.profile_id))
     return retired
