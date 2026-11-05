@@ -165,11 +165,15 @@ def agent_joins_delegation(agent: Any) -> bool:
         agent._delegation_inline = cached
     return cached
 
-def _get_worktree_isolation() -> bool:
-    """delegation.worktree_isolation (bool, default False): each child gets its own
+def _get_worktree_isolation() -> bool | str:
+    """delegation.worktree_isolation (default False): each child gets its own
     git worktree off the parent's HEAD so parallel children never contend for one
-    working copy. Git-only and local-backend-only; otherwise silently ignored."""
-    return bool(_cfg().get("worktree_isolation", False))
+    working copy. Git-only and local-backend-only. ``True`` falls back to the
+    shared workspace when no worktree can be made; ``"required"`` refuses the child."""
+    value = _cfg().get("worktree_isolation", False)
+    if isinstance(value, str) and value.strip().lower() == "required":
+        return "required"
+    return bool(value)
 
 def _get_max_async_children() -> int:
     """Concurrency cap for background delegations == delegation.max_concurrent_children. At capacity a new async

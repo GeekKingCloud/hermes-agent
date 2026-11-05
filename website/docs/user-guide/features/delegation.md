@@ -717,7 +717,7 @@ worktree, branched from the repo's current `HEAD` (inspired by Muse Code's
 
 ```yaml
 delegation:
-  worktree_isolation: true   # default: false
+  worktree_isolation: true   # default: false; or "required" (see Scope below)
 ```
 
 With isolation on:
@@ -738,10 +738,15 @@ With isolation on:
   defaults, not measurements, so inspect the worktree rather than assuming
   the child produced nothing.
 
-Scope: opt-in, git-only, and local-terminal-backend-only. In a non-git
-directory, on docker/ssh/modal backends, or if worktree creation fails, the
-setting degrades silently to today's shared-workspace behavior — never an
+Scope: opt-in, git-only, and local-terminal-backend-only. With `true`, in a
+non-git directory, on docker/ssh/modal backends, or if worktree creation fails,
+the setting degrades silently to today's shared-workspace behavior — never an
 error.
+
+Set `worktree_isolation: required` when children must never share the parent's
+checkout. In each of those cases the child is not run: its result entry is an
+error saying isolation was unavailable. Successful runs behave exactly as with
+`true`.
 
 ## Delegation vs execute_code
 
@@ -766,7 +771,7 @@ delegation:
   # max_concurrent_children: 10             # Parallel children per batch (default: 10)
   # independent_completions: false          # true = each task/group returns as it finishes (default: one message per call)
   # gateway_mode: auto                      # auto | inline | background (see Messaging chats without interim messages)
-  # worktree_isolation: false               # Give each child its own git worktree (see Worktree Isolation above)
+  # worktree_isolation: false               # true = own git worktree per child, best-effort; required = refuse without one (see Worktree Isolation above)
   # max_spawn_depth: 1                      # Tree depth (floor 1, no ceiling, default 1 = flat). Raise to 2 to allow orchestrator children to spawn leaves; 3+ for deeper trees.
   # orchestrator_enabled: true              # Disable to force all children to leaf role.
   model: "google/gemini-3-flash-preview"             # Optional provider/model override
