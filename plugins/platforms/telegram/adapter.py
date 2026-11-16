@@ -198,6 +198,7 @@ from plugins.platforms.telegram.telegram_media_retry import unconfirmed_media_re
 from plugins.platforms.telegram import telegram_flood_window as _flood_window
 from plugins.platforms.telegram.telegram_media_fetch import (
     cache_replied_media, fetch_telegram_file, local_root, merged_typed_text, record_typed_text)
+from plugins.platforms.telegram import telegram_media_pending as _media_pending
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id, parse_send_target, parse_telegram_message_id
 from plugins.platforms.telegram.telegram_resolved_prompt import edit_keeping_prompt
 from plugins.platforms.telegram.telegram_clarify_binding import ClarifyPrompt, tap_matches_prompt
@@ -1562,7 +1563,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         """Record successful getUpdates I/O for the current generation only; True when accepted."""
         if self._teardown_started or not self._polling_progress_accepting or generation != self._polling_generation:
             return False
-        if not self._polling_progress_event.is_set():
+        recovered = not self._polling_progress_event.is_set()
+        if recovered:
             # First confirmed round-trip resolves the "health pending" line both reconnect paths end on.
             # After network-error WARNINGs the line must read as the matching recovery event (#111211).
             state = "recovered" if self._polling_network_error_count else "confirmed healthy"
@@ -1572,6 +1574,10 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         self._polling_network_error_count = 0
         self._note_conflict_quiet_progress(self._polling_last_progress_monotonic)
         mark_send_path_recovered(self)
+        try:  # media whose download failed in the outage is fetched again now (telegram_media_pending)
+            _media_pending.on_polling_progress(self, recovered=recovered)
+        except Exception:
+            logger.warning("[%s] Deferred media re-fetch could not start", self.name, exc_info=True)
         return True
 
     def _observe_polling_request_result(self, request, generation, result):
@@ -3115,6 +3121,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         # Mark disconnected first so the drop guard short-circuits any flush that wins the race.
         self._mark_disconnected()
         self._polling_teardown_started = True
+        _media_pending.log_unserved(self)
         self._polling_progress_accepting = False
         self._polling_generation = getattr(self, "_polling_generation", 0) + 1
         self._polling_progress_event = asyncio.Event()
@@ -5691,6 +5698,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         attempted and failed — never a silent empty turn. No new event fields (the structured-event refactor
         is out of scope per #23045).
         """
+        if _media_pending.should_defer(self, msg, exc):
+            raise _media_pending.MediaFetchDeferred(kind)  # Telegram is failing: re-fetch when it recovers
         # Inbound media fails before handle_message binds the routed profile.
         with self._media_delivery_scope(event.source):
             named = t("platform.telegram.media.named_suffix", name=display_name) if display_name else ""
@@ -6165,6 +6174,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             await self._surface_media_cache_failure(msg, event, "attachment", e, display_name=getattr(doc, "file_name", None) or None)
         return False
 
+    @_media_pending.deferring_media_fetch
     @tracking_media_items
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
@@ -6192,6 +6202,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             await self.handle_message(self._apply_telegram_group_observe_attribution(event))
             return
         event = self._apply_telegram_group_observe_attribution(event)
+        if replay_note := _media_pending.replay_note():
+            event.text = self._append_observed_note(event.text, replay_note)
         claim_pending_text(self, msg, event)  # before the first await: the comment typed just before waits for us
         # Cache photo locally: Telegram's file URLs expire (~1 hour) before vision may run.
         if msg.photo:
