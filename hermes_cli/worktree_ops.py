@@ -631,6 +631,7 @@ def _save_worktree_merge_cache(verdicts: dict[str, bool]) -> None:
 
 def _worktree_commits_all_merged_upstream(
     worktree_path: str, timeout: int = 30, max_ahead: int = 20, cache: Optional[dict[str, bool]] = None,
+    head: str = "HEAD",
 ) -> bool:
     """Whether every local-only commit is patch-equivalent (``git cherry``) to upstream. Fails SAFE -> False.
 
@@ -638,6 +639,7 @@ def _worktree_commits_all_merged_upstream(
     from ``refs/remotes/*`` forever). Upstream is ``_worktree_merge_base_ref`` (the local trunk in
     a repo without remotes). More than *max_ahead* ahead = stale-base tree -> False.
     *cache* memoizes on ``(base_sha, head_sha, max_ahead)``, exactly what ``git cherry`` consumes.
+    *head* is the commit judged (default the tree's ``HEAD``; a branch tip for a tree-less branch).
     """
     try:
         base = _worktree_merge_base_ref(worktree_path, timeout=timeout)
@@ -646,7 +648,7 @@ def _worktree_commits_all_merged_upstream(
 
         cache_key = None
         if cache is not None:
-            revs = _git_out(["rev-parse", f"{base}^{{commit}}", "HEAD^{commit}"], worktree_path,
+            revs = _git_out(["rev-parse", f"{base}^{{commit}}", f"{head}^{{commit}}"], worktree_path,
                             timeout=timeout)
             shas = (revs or "").split()
             if len(shas) == 2:
@@ -659,7 +661,7 @@ def _worktree_commits_all_merged_upstream(
                 cache[cache_key] = verdict
             return verdict
 
-        ahead = _git_out(["rev-list", "--count", f"{base}..HEAD"], worktree_path, timeout=timeout)
+        ahead = _git_out(["rev-list", "--count", f"{base}..{head}"], worktree_path, timeout=timeout)
         if ahead is None:
             return False
         count = int(ahead or "0")
@@ -668,7 +670,7 @@ def _worktree_commits_all_merged_upstream(
         if count > max_ahead:
             return _memo(False)
 
-        cherry = _git(["cherry", base, "HEAD"], worktree_path, timeout=timeout)
+        cherry = _git(["cherry", base, head], worktree_path, timeout=timeout)
         if cherry.returncode != 0:
             return False
         lines = [ln for ln in cherry.stdout.splitlines() if ln.strip()]
@@ -1216,8 +1218,19 @@ def _warn_worktree_footprint(repo_root: str) -> None:
         logger.debug("worktree summary failed", exc_info=True)
 
 
+# Branch namespaces the orphan pass deletes outright once they have no worktree: never proof that work is kept.
+_DISPOSABLE_BRANCH_PREFIXES = ("hermes/hermes-", "pr-")
+
+
 def _prune_orphaned_branches(repo_root: str, protect: Optional[set] = None) -> None:
-    """Delete local ``hermes/hermes-*`` and ``pr-*`` branches with no worktree, except *protect*."""
+    """Delete local ``hermes/hermes-*`` and ``pr-*`` branches with no worktree, except *protect*.
+
+    A finished subagent's branch (``tools.subagent_worktree.SUBAGENT_BRANCH_PREFIX``) with no
+    worktree goes only once its work is merged (``_prune_merged_subagent_branches``). Registrations
+    of trees deleted from disk are pruned first: they would otherwise pin their branches forever.
+    """
+    _git_quiet(["worktree", "prune"], repo_root, timeout=15, log="Failed to prune worktree registrations",
+               stdin=subprocess.DEVNULL, env=noninteractive_git_env())
     try:
         listing = _git_out(["branch", "--format=%(refname:short)"], repo_root)
         if listing is None:
@@ -1229,6 +1242,8 @@ def _prune_orphaned_branches(repo_root: str, protect: Optional[set] = None) -> N
     active_branches: set = set()
     try:
         wt_result = _git(["worktree", "list", "--porcelain"], repo_root)
+        if wt_result.returncode != 0:
+            return  # can't determine active branches: bail
         for line in wt_result.stdout.split("\n"):
             if line.startswith("branch refs/heads/"):
                 active_branches.add(line.split("branch refs/heads/", 1)[-1].strip())
@@ -1244,13 +1259,53 @@ def _prune_orphaned_branches(repo_root: str, protect: Optional[set] = None) -> N
         pass
     active_branches.add("main")
 
-    orphaned = [b for b in all_branches if b not in active_branches and b not in (protect or ())
-                and (b.startswith("hermes/hermes-") or b.startswith("pr-"))]
+    unattached = [b for b in all_branches if b not in active_branches and b not in (protect or ())]
+    orphaned = [b for b in unattached if b.startswith(_DISPOSABLE_BRANCH_PREFIXES)]
 
-    if not orphaned:
-        return
     for i in range(0, len(orphaned), 50):
         _git_quiet(["branch", "-D"] + orphaned[i:i + 50], repo_root, timeout=30,
                    log="Failed to prune orphaned branches",
                    stdin=subprocess.DEVNULL, env=noninteractive_git_env())
-    logger.debug("Pruned %d orphaned branches", len(orphaned))
+    if orphaned:
+        logger.debug("Pruned %d orphaned branches", len(orphaned))
+    _prune_merged_subagent_branches(repo_root, unattached)
+
+
+def _prune_merged_subagent_branches(repo_root: str, branches: list) -> None:
+    """Delete the subagent branches among *branches* (none has a worktree) whose child finished and
+    whose work is merged; anything unproven is kept.
+
+    Finished: not live in this process (``live_subagent_branches``) and no tree left at its
+    ``.worktrees/`` path. Merged: every commit is reachable from a remote-tracking ref outside the
+    subagent namespace or from a local branch outside it and the disposable namespaces (a
+    ``hermes/hermes-*`` or ``pr-*`` branch is itself deleted unchecked later), or patch-equivalent to upstream
+    (``_worktree_commits_all_merged_upstream``). Deletion compares against the verified tip, so a
+    branch that moved since the check survives.
+    """
+    from tools.subagent_worktree import SUBAGENT_BRANCH_PREFIX, live_subagent_branches
+    live = live_subagent_branches()
+    worktrees_dir = Path(repo_root) / ".worktrees"
+    pruned = 0
+    for branch in branches:
+        if not branch.startswith(SUBAGENT_BRANCH_PREFIX) or branch in live:
+            continue
+        try:
+            if (worktrees_dir / branch[len(SUBAGENT_BRANCH_PREFIX):]).exists():
+                continue  # its tree is still on disk (being created, or not yet registered): not finished
+            tip = _git_out(["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}"], repo_root)
+            if not tip:
+                continue
+            durable_branches = [f"--exclude={p}*" for p in (SUBAGENT_BRANCH_PREFIX, *_DISPOSABLE_BRANCH_PREFIXES)]
+            unique = _git_out(["rev-list", "--count", tip, "--not", *durable_branches, "--branches",
+                               f"--exclude=*/{SUBAGENT_BRANCH_PREFIX}*", "--remotes"], repo_root, timeout=30)
+            if unique != "0" and not _worktree_commits_all_merged_upstream(repo_root, head=tip):
+                continue  # unmerged commits, or unverifiable: keep
+            # Unattended: the repository's reference-transaction hook must not run.
+            deleted = _git(["update-ref", "-d", f"refs/heads/{branch}", tip], repo_root, timeout=15,
+                           stdin=subprocess.DEVNULL, env=noninteractive_git_env())
+            if deleted.returncode == 0:
+                pruned += 1
+        except Exception as e:
+            logger.debug("Failed to prune subagent branch %s: %s", branch, e)
+    if pruned:
+        logger.debug("Pruned %d merged subagent branches", pruned)

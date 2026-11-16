@@ -197,7 +197,8 @@ def test_index_reading_probes_and_kanban_gc_git_are_safe(malicious_repo, tmp_pat
     ``worktree add`` also runs the repository's hooks, and ``branch -D`` its reference-transaction
     hook. Recovery hint, completion probe, kanban worktree, worktree-gc ``status``, the reclaimers'
     dirty probe (kanban teardown), and the three unattended branch deletions: the reclaim sweep,
-    the orphaned-branch pass and the cleanup after a failed ``worktree add``. The reclaim sweep's
+    the orphaned-branch pass (a merged subagent branch included) and the cleanup after a failed
+    ``worktree add``. The reclaim sweep's
     ``ls-remote`` and the shallow-repo ``fetch --unshallow`` must not run a repo ``core.sshCommand``."""
     from hermes_cli import kanban_db_workspace as kw
     from hermes_cli import worktree_gc, worktree_ops
@@ -213,8 +214,9 @@ def test_index_reading_probes_and_kanban_gc_git_are_safe(malicious_repo, tmp_pat
     assert _fired(marker) == []
     assert dirty is False  # the probe ran: a skipped one reads as dirty
 
-    subprocess.run(["git", "-C", str(repo), "-c", "core.hooksPath=/dev/null", "branch", "pr-1"], check=True,
-                   env=_CLEAN_GIT_ENV)
+    for name in ("pr-1", "hermes-subagent/subagent-done"):
+        subprocess.run(["git", "-C", str(repo), "-c", "core.hooksPath=/dev/null", "branch", name], check=True,
+                       env=_CLEAN_GIT_ENV)
     kw._ensure_git_worktree(repo, tmp_path / "wt3", "safe3")
     worktree_ops._reap_prune_verdicts(str(repo), [(tmp_path / "wt2", 0.0, False, "reap", None)], 0.0)
     worktree_ops._prune_orphaned_branches(str(repo))
@@ -222,7 +224,7 @@ def test_index_reading_probes_and_kanban_gc_git_are_safe(malicious_repo, tmp_pat
     assert _fired(marker) == []
     branches = subprocess.run(["git", "-C", str(repo), "branch", "--format=%(refname:short)"],
                               capture_output=True, text=True, env=_CLEAN_GIT_ENV, check=False).stdout.split()
-    assert not {"safe2", "pr-1", "safe3"} & set(branches)  # the deletions ran
+    assert not {"safe2", "pr-1", "hermes-subagent/subagent-done", "safe3"} & set(branches)  # the deletions ran
 
     for key, value in {"remote.origin.url": "ssh://git@example.invalid/x.git",
                        "core.sshCommand": f"touch '{marker.as_posix()}.ssh'; false"}.items():

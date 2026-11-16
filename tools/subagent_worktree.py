@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -22,6 +23,26 @@ from hermes_cli._subprocess_compat import harden_git_argv, noninteractive_git_en
 logger = logging.getLogger(__name__)
 
 _GIT_TIMEOUT = 30
+
+# Branch namespace of isolated children. The unattended orphan-branch pass
+# (``worktree_ops._prune_orphaned_branches``) matches on this, so keep one definition.
+SUBAGENT_BRANCH_PREFIX = "hermes-subagent/"
+
+# Branches of children this process is still running (create -> finalize): the orphan-branch pass
+# never deletes one, including in the gap between ``worktree add`` creating it and registering the tree.
+_live_branches: set[str] = set()
+_live_lock = threading.Lock()
+
+
+def live_subagent_branches() -> frozenset[str]:
+    """Branches of the children this process has created and not yet finalized."""
+    with _live_lock:
+        return frozenset(_live_branches)
+
+
+def _set_branch_live(branch: str, live: bool) -> None:
+    with _live_lock:
+        (_live_branches.add if live else _live_branches.discard)(branch)
 
 
 def _run_git(args, cwd: str, timeout: int = _GIT_TIMEOUT, env=None):
@@ -80,7 +101,7 @@ def create_subagent_worktree(parent_cwd: Optional[str], subagent_id: Optional[st
     if not repo_root:
         return None
     wt_name = f"subagent-{(subagent_id or uuid.uuid4().hex[:8]).replace('/', '-')}"
-    branch = f"hermes-subagent/{wt_name}"
+    branch = f"{SUBAGENT_BRANCH_PREFIX}{wt_name}"
     wt_path = Path(repo_root) / ".worktrees" / wt_name
     try:
         wt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -93,11 +114,14 @@ def create_subagent_worktree(parent_cwd: Optional[str], subagent_id: Optional[st
         if add_env is None:
             logger.warning("subagent worktree: filter discovery failed; not creating a worktree")
             return None
+        _set_branch_live(branch, True)
         result = _run_git(["worktree", "add", str(wt_path), "-b", branch, "HEAD"], cwd=repo_root, env=add_env)
     except Exception as exc:
+        _set_branch_live(branch, False)
         logger.warning("subagent worktree: creation failed: %s", exc)
         return None
     if result.returncode != 0:
+        _set_branch_live(branch, False)
         # Common on repos with zero commits (unborn HEAD) — degrade silently.
         logger.warning("subagent worktree: git worktree add failed: %s", result.stderr.strip())
         return None
@@ -143,7 +167,15 @@ def finalize_subagent_worktree(info: dict[str, str], *, prune: bool = True) -> d
 
     Prunes only when *prune*, commits==0, clean tree AND both git probes succeeded; otherwise
     keeps it with ``inspection_failed`` + ``note`` (``commits``/``dirty`` then are defaults).
+    The child is finished either way: its branch leaves the live set.
     """
+    try:
+        return _finalize_subagent_worktree(info, prune=prune)
+    finally:
+        _set_branch_live(info.get("branch", ""), False)
+
+
+def _finalize_subagent_worktree(info: dict[str, str], *, prune: bool) -> dict[str, Any]:
     path, branch = info.get("path", ""), info.get("branch", "")
     base_commit = info.get("base_commit", "")
     payload = _base_payload(info)
