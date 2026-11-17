@@ -74,6 +74,37 @@ def test_peer_bench_for_the_rate_limited_model_ends_the_wait(auth_store):
     assert session_pool.entries()[1].model_cooldowns in (None, {})
 
 
+def test_peer_credential_wide_bench_ends_the_wait_until_it_lapses_or_is_reset(auth_store):
+    _write_pool(auth_store, [_entry("seat-a", KEY_A, 0), _entry("seat-b", KEY_B, 1)])
+    session_pool = _load()
+
+    def hinge(**kw):
+        return _pool_may_recover_from_rate_limit(session_pool, failed_key=KEY_A, failed_entry_id="seat-a", **kw)
+
+    # A model-less 429 (the auxiliary path) benches the whole credential, not one model.
+    ctx = {"message": "rate limit", "reset_at": time.time() + 3600}
+    _load().mark_exhausted_and_rotate(
+        status_code=429, error_context=ctx, api_key_hint=KEY_B, failure_reason="rate_limit")
+    row = json.loads(auth_store.read_text())["credential_pool"]["anthropic"][1]
+    assert row["last_status"] == "exhausted" and not row.get("model_cooldowns")
+
+    assert session_pool.has_available(model=MODEL_X) is True
+    assert hinge(model=MODEL_X) is False
+    assert hinge() is False
+
+    rows = json.loads(auth_store.read_text())
+    rows["credential_pool"]["anthropic"][1]["last_error_reset_at"] = time.time() - 5
+    auth_store.write_text(json.dumps(rows))
+    assert hinge(model=MODEL_X) is True
+
+    _load().mark_exhausted_and_rotate(
+        status_code=429, error_context=ctx, api_key_hint=KEY_B, failure_reason="rate_limit")
+    assert hinge(model=MODEL_X) is False
+    _load().reset_status("seat-b")  # `hermes auth reset` from another process
+    assert hinge(model=MODEL_X) is True
+    assert session_pool.entries()[1].last_status in (None, "ok")
+
+
 def test_lapsed_peer_bench_does_not_block(auth_store):
     _write_pool(auth_store, [_entry("seat-a", KEY_A, 0), _entry("seat-b", KEY_B, 1)])
     pool = _load()

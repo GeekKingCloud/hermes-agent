@@ -156,30 +156,37 @@ class CredentialPoolModelCooldownMixin:
                 if entry.id != exclude_id
                 and not (exclude_key and entry.runtime_api_key == exclude_key)
             ]
-            if not targets or not model:
-                return bool(targets)
-            persisted = self._persisted_model_cooldowns()
-            return any(
-                _cooldown_active(persisted.get(entry.id, {}).get(model)) is False for entry in targets
-            )
+            if not targets:
+                return False
+            persisted = self._persisted_entries()
+            return any(_persisted_usable(persisted.get(entry.id), model) for entry in targets)
 
-    def _persisted_model_cooldowns(self) -> dict[str, dict[str, Any]]:
-        """``{entry_id: model_cooldowns}`` as the auth store has them right now (peer writers included)."""
+    def _persisted_entries(self) -> dict[str, PooledCredential]:
+        """``{entry_id: entry}`` as the auth store has them right now (peer writers included)."""
+        from agent.credential_pool import PooledCredential
         from hermes_cli.auth import read_credential_pool
 
         try:
             rows = read_credential_pool(self.provider)
+            return {
+                row["id"]: PooledCredential.from_dict(self.provider, row)
+                for row in (rows if isinstance(rows, list) else [])
+                if isinstance(row, dict) and isinstance(row.get("id"), str)
+            }
         except (OSError, ValueError, TypeError, KeyError) as exc:
             # A malformed or vanished auth.json must not turn a 429 into a crash: fall open to the
             # in-memory verdict (yesterday's behaviour) and leave a trace for "why did it still wait?".
             logger.debug("credential pool: could not read persisted cooldowns for %s: %s", self.provider, exc)
             return {}
-        return {
-            row["id"]: row.get("model_cooldowns") or {}
-            for row in (rows if isinstance(rows, list) else [])
-            if isinstance(row, dict) and isinstance(row.get("id"), str)
-        }
 
 
-def _cooldown_active(until: Any) -> bool:
-    return isinstance(until, (int, float)) and until > time.time()
+def _persisted_usable(row: Optional[PooledCredential], model: Optional[str]) -> bool:
+    """A peer-written row is no target while DEAD, cooled down for *model*, or exhausted credential-wide."""
+    from agent.credential_pool import STATUS_DEAD, _exhausted_until
+
+    if row is None:
+        return True
+    if row.last_status == STATUS_DEAD or model_cooldown_until(row, model) is not None:
+        return False
+    until = _exhausted_until(row)
+    return until is None or until <= time.time()
