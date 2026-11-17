@@ -201,6 +201,34 @@ async def test_restart_wait_ws_serves_the_parked_turn_and_refuses_every_other_ve
 
 
 @pytest.mark.asyncio
+async def test_restart_wait_ws_lets_a_cron_firer_observe_its_admitted_run(tmp_path):
+    """The wait waits for an admitted cron run; its firer's socket may still ask after it (status,
+    recover) or stop it (cancel), but never admit a new one."""
+    from gateway.drain_control import ws_method_refused_while_draining
+    from gateway.session_authority import SessionAuthority
+    from gateway.session_controls import AuthorityConnection
+
+    db = SessionDB(tmp_path / "state.db")
+    runner = SimpleNamespace(_draining=True, _running=True,
+                             session_runtime_descriptor={"state": "draining", "drain_reason": "restart_wait"})
+    authority = SessionAuthority(runner, profile_id="p", instance_id="owner", db=db,
+                                 epoch=begin_runtime_epoch(db, instance_id="owner"))
+    viewer = AuthorityConnection(authority, object(), {"user_id": "human"}, operator=True)
+    try:
+        for method in ("cron.status", "cron.cancel", "cron.recover"):
+            assert not ws_method_refused_while_draining(runner, method)
+            # Reached the cron operation: its own verdict on these params, never the drain's refusal.
+            answer = await viewer.dispatch({"id": 1, "method": method, "params": {}})
+            assert answer.get("error", {}).get("message") != "runtime_draining", (method, answer)
+        assert ws_method_refused_while_draining(runner, "cron.submit")
+        refused = await viewer.dispatch({"id": 2, "method": "cron.submit", "params": {}})
+        assert refused["error"]["message"] == "runtime_draining"
+    finally:
+        await viewer.close()
+        db.close()
+
+
+@pytest.mark.asyncio
 async def test_restart_wait_queues_only_interactive_input(tmp_path, monkeypatch):
     """Only the interactive WS submit commits queued input during the wait; a2a, kanban and hosted
     rooms call ``authority.submit`` directly and keep the plain refusal, so none of them can read a

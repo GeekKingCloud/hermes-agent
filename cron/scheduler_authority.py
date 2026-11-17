@@ -2,7 +2,11 @@
 import asyncio
 import hashlib
 import json
+import logging
+import time
 import uuid
+
+logger = logging.getLogger(__name__)
 
 
 class CronExecutionUnknown(RuntimeError):
@@ -53,10 +57,13 @@ def _lift_pause(job_id, pause):
 
 
 def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id=None):
+    from contextlib import AsyncExitStack
     from gateway.session_cron import owner_for_home, operation
-    from hermes_cli.gateway_client import connect_gateway
+    from hermes_cli.gateway_client import GatewayClientError, connect_gateway
+    from hermes_cli.gateway_owner_restart import restartable
     from hermes_constants import get_hermes_home
     from utils import atomic_json_write
+    from websockets.exceptions import WebSocketException
 
     request_id = execution_id or job.get('execution_id')
     if not request_id:
@@ -82,7 +89,7 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
         # write (file and directory) waits in a worker, and still completes before the next step.
         await asyncio.to_thread(write_journal)
 
-    async def observe(call):
+    async def observe(call, redial=None):
         nonlocal attempted
         attempted = True
         await save()
@@ -109,11 +116,41 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
                 raise
         record['receipt'] = receipt
         await save()
-        delay, progress = .1, None
+        delay, progress, answered, lost = .1, None, time.monotonic(), False
         while True:
-            if cancel_event is not None and cancel_event.is_set():
-                await call('cancel', receipt)
-            state = await call('status', receipt)
+            try:
+                if lost:
+                    # The admitted run goes on in the owner when our socket goes: a restart's
+                    # after-turn wait cuts it (1013) while it waits for this very run. Dial again
+                    # (the wait admits the new socket; a successor answers once it is up) and ask
+                    # after the same admission; nothing is submitted again.
+                    call = await redial()
+                    state = await call('recover', params)
+                    if state['status'] not in {'queued', 'started', 'terminal'}:
+                        raise CronExecutionUnknown(f"{state['status']}_execution: cron admission was not recovered")
+                    receipt, lost = {'session_id': state['session_id'], 'admission_id': state['admission_id']}, False
+                    logger.info('Cron %s: recovered its admitted run (%s)', job['id'], state['status'])
+                if cancel_event is not None and cancel_event.is_set():
+                    await call('cancel', receipt)
+                state = await call('status', receipt)
+            except (GatewayClientError, WebSocketException, OSError) as exc:
+                # A lost socket or a restarting owner (``redial`` set: not this process's own
+                # owner): reconnect. Only silence past the job's own inactivity budget (0:
+                # unlimited) leaves the run unverified; an owner's own refusal is final.
+                if redial is None or not restartable(exc):
+                    raise
+                from cron.scheduler import _cron_inactivity_seconds
+                budget = _cron_inactivity_seconds()
+                if 0 < budget <= time.monotonic() - answered:
+                    raise
+                if not lost:
+                    lost = True
+                    logger.info('Cron %s: gateway connection lost while its run is admitted (%s); '
+                                'reconnecting to recover it', job['id'], type(exc).__name__)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 2.0)
+                continue
+            answered = time.monotonic()
             if state.get('progress_at') not in (None, progress):
                 # The owner's agent is still working: refresh OUR ledger row (the owner's stamp is
                 # fenced to the row's owner), once per owner stamp, so the stale-claim sweep measures
@@ -130,8 +167,13 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
             delay = min(delay * 2, 2.0)
 
     async def remote():
-        async with connect_gateway() as client:
-            return await observe(lambda op, data: client.rpc('cron.' + op, **data))
+        async with AsyncExitStack() as connection:
+            async def dial():
+                await connection.aclose()  # the dropped socket, if any
+                client = await connection.enter_async_context(connect_gateway())
+                return lambda op, data: client.rpc('cron.' + op, **data)
+
+            return await observe(await dial(), redial=dial)
 
     try:
         if owner is not None:
